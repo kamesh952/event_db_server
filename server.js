@@ -10,7 +10,7 @@ const app = express();
 
 // Middleware
 app.use(cors({
-  origin: 'http://localhost:5174', // Your React app's URL
+  origin: 'https://event-db-client.onrender.com', // Your React app's URL
   credentials: true
 }));
 app.use(bodyParser.json());
