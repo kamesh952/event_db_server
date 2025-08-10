@@ -10,7 +10,7 @@ const app = express();
 
 // Middleware
 app.use(cors({
-  origin: 'http://localhost:5173', // Your React app's URL
+  origin: 'http://localhost:5174', // Your React app's URL
   credentials: true
 }));
 app.use(bodyParser.json());
@@ -102,6 +102,71 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+// Dashboard Statistics
+app.get('/api/dashboard', authenticateToken, async (req, res) => {
+  try {
+    // Get user's total events created
+    const eventsCount = await pool.query(
+      'SELECT COUNT(*) FROM events WHERE user_id = $1',
+      [req.user.id]
+    );
+    
+    // Get user's total bookings made
+    const bookingsCount = await pool.query(
+      'SELECT COUNT(*) FROM bookings WHERE user_id = $1',
+      [req.user.id]
+    );
+    
+    // Get user's upcoming events (both created and booked)
+    const upcomingEvents = await pool.query(
+      `SELECT e.id, e.title, e.date, e.location, 
+       CASE WHEN e.user_id = $1 THEN 'creator' ELSE 'attendee' END as role
+       FROM events e
+       LEFT JOIN bookings b ON e.id = b.event_id
+       WHERE (e.user_id = $1 OR b.user_id = $1) AND e.date > NOW()
+       ORDER BY e.date ASC
+       LIMIT 5`,
+      [req.user.id]
+    );
+    
+    // Get recent bookings
+    const recentBookings = await pool.query(
+      `SELECT b.id, b.created_at, e.title, e.date, e.location 
+       FROM bookings b
+       JOIN events e ON b.event_id = e.id
+       WHERE b.user_id = $1
+       ORDER BY b.created_at DESC
+       LIMIT 5`,
+      [req.user.id]
+    );
+    
+    // Get rooms/venues statistics (assuming rooms are part of events)
+    const roomsStats = await pool.query(
+      `SELECT location as room_name, 
+       COUNT(*) as total_events,
+       SUM(CASE WHEN date > NOW() THEN 1 ELSE 0 END) as upcoming_events
+       FROM events
+       WHERE user_id = $1
+       GROUP BY location
+       ORDER BY upcoming_events DESC`,
+      [req.user.id]
+    );
+    
+    res.json({
+      stats: {
+        eventsCreated: parseInt(eventsCount.rows[0].count),
+        bookingsMade: parseInt(bookingsCount.rows[0].count),
+      },
+      upcomingEvents: upcomingEvents.rows,
+      recentBookings: recentBookings.rows,
+      roomsStats: roomsStats.rows
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch dashboard data' });
+  }
+});
+
 // Profile Section
 app.get('/api/profile', authenticateToken, async (req, res) => {
   try {
@@ -117,7 +182,7 @@ app.get('/api/profile', authenticateToken, async (req, res) => {
     
     // Get user's created events
     const eventsResult = await pool.query(
-      'SELECT id, title, date, location FROM events WHERE user_id = $1',
+      'SELECT id, title, date, location FROM events WHERE user_id = $1 ORDER BY date DESC',
       [req.user.id]
     );
     
@@ -127,7 +192,8 @@ app.get('/api/profile', authenticateToken, async (req, res) => {
        e.id as event_id, e.title, e.date, e.location 
        FROM bookings b 
        JOIN events e ON b.event_id = e.id 
-       WHERE b.user_id = $1`,
+       WHERE b.user_id = $1
+       ORDER BY b.created_at DESC`,
       [req.user.id]
     );
     
@@ -175,6 +241,79 @@ app.put('/api/profile', authenticateToken, async (req, res) => {
   }
 });
 
+// Rooms/Venues CRUD Operations
+
+// Get All Rooms (distinct locations from events)
+app.get('/api/rooms', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT DISTINCT location as name FROM events WHERE user_id = $1 ORDER BY location',
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch rooms' });
+  }
+});
+
+// Add/Update Room (actually updates events with this location)
+app.post('/api/rooms', authenticateToken, async (req, res) => {
+  try {
+    const { oldName, newName } = req.body;
+    
+    if (!oldName || !newName) {
+      return res.status(400).json({ error: 'Both oldName and newName are required' });
+    }
+    
+    // Update all events with the old location name to the new name
+    const result = await pool.query(
+      'UPDATE events SET location = $1 WHERE location = $2 AND user_id = $3 RETURNING location',
+      [newName, oldName, req.user.id]
+    );
+    
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'No rooms found with that name or not authorized' });
+    }
+    
+    res.json({ message: 'Room updated successfully', newName });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update room' });
+  }
+});
+
+// Delete Room (actually deletes all events in this location)
+app.delete('/api/rooms/:name', authenticateToken, async (req, res) => {
+  try {
+    const roomName = req.params.name;
+    
+    // First delete all bookings for events in this location
+    await pool.query(
+      `DELETE FROM bookings 
+       WHERE event_id IN (
+         SELECT id FROM events WHERE location = $1 AND user_id = $2
+       )`,
+      [roomName, req.user.id]
+    );
+    
+    // Then delete the events in this location
+    const result = await pool.query(
+      'DELETE FROM events WHERE location = $1 AND user_id = $2 RETURNING *',
+      [roomName, req.user.id]
+    );
+    
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Room not found or not authorized' });
+    }
+    
+    res.json({ message: 'Room and all associated events deleted successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete room' });
+  }
+});
+
 // Events CRUD Operations
 
 // Create Event
@@ -192,11 +331,29 @@ app.post('/api/events', authenticateToken, async (req, res) => {
   }
 });
 
-// Get All Events
+// Get All Events (with pagination)
 app.get('/api/events', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM events');
-    res.json(result.rows);
+    const { page = 1, limit = 10 } = req.query;
+    const offset = (page - 1) * limit;
+    
+    const result = await pool.query(
+      'SELECT * FROM events ORDER BY date DESC LIMIT $1 OFFSET $2',
+      [limit, offset]
+    );
+    
+    const countResult = await pool.query('SELECT COUNT(*) FROM events');
+    const total = parseInt(countResult.rows[0].count);
+    
+    res.json({
+      events: result.rows,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch events' });
@@ -209,7 +366,14 @@ app.get('/api/events/:id', authenticateToken, async (req, res) => {
     const eventId = req.params.id;
     
     // Get event details
-    const eventResult = await pool.query('SELECT * FROM events WHERE id = $1', [eventId]);
+    const eventResult = await pool.query(
+      `SELECT e.*, u.name as organizer_name 
+       FROM events e
+       JOIN users u ON e.user_id = u.id
+       WHERE e.id = $1`,
+      [eventId]
+    );
+    
     if (eventResult.rows.length === 0) {
       return res.status(404).json({ error: 'Event not found' });
     }
@@ -220,11 +384,18 @@ app.get('/api/events/:id', authenticateToken, async (req, res) => {
       [eventId, req.user.id]
     );
     
+    // Get total bookings for this event
+    const bookingsCount = await pool.query(
+      'SELECT SUM(seats) as total_seats FROM bookings WHERE event_id = $1',
+      [eventId]
+    );
+    
     const event = eventResult.rows[0];
     const response = {
       ...event,
       hasBooked: bookingResult.rows.length > 0,
-      bookingDetails: bookingResult.rows.length > 0 ? bookingResult.rows[0] : null
+      bookingDetails: bookingResult.rows.length > 0 ? bookingResult.rows[0] : null,
+      bookedSeats: parseInt(bookingsCount.rows[0].total_seats) || 0
     };
     
     res.json(response);
@@ -284,6 +455,11 @@ app.post('/api/bookings', authenticateToken, async (req, res) => {
   try {
     const { event_id, seats } = req.body;
     
+    // Check if seats is a positive number
+    if (!seats || seats <= 0) {
+      return res.status(400).json({ error: 'Number of seats must be positive' });
+    }
+    
     // Check if user has already booked this event
     const existingBooking = await pool.query(
       'SELECT id FROM bookings WHERE event_id = $1 AND user_id = $2',
@@ -326,6 +502,9 @@ app.post('/api/bookings', authenticateToken, async (req, res) => {
 // Get User Bookings with more details
 app.get('/api/bookings', authenticateToken, async (req, res) => {
   try {
+    const { page = 1, limit = 10 } = req.query;
+    const offset = (page - 1) * limit;
+    
     const result = await pool.query(
       `SELECT b.id, b.seats, b.created_at as booking_date, 
        e.id as event_id, e.title, e.description, e.date, e.location, 
@@ -333,13 +512,82 @@ app.get('/api/bookings', authenticateToken, async (req, res) => {
        FROM bookings b 
        JOIN events e ON b.event_id = e.id
        JOIN users u ON e.user_id = u.id
-       WHERE b.user_id = $1`,
+       WHERE b.user_id = $1
+       ORDER BY b.created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [req.user.id, limit, offset]
+    );
+    
+    const countResult = await pool.query(
+      'SELECT COUNT(*) FROM bookings WHERE user_id = $1',
       [req.user.id]
     );
-    res.json(result.rows);
+    const total = parseInt(countResult.rows[0].count);
+    
+    res.json({
+      bookings: result.rows,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch bookings' });
+  }
+});
+
+// Update Booking (change number of seats)
+app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
+  try {
+    const { seats } = req.body;
+    
+    if (!seats || seats <= 0) {
+      return res.status(400).json({ error: 'Number of seats must be positive' });
+    }
+    
+    // Get current booking details
+    const booking = await pool.query(
+      'SELECT * FROM bookings WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.id]
+    );
+    
+    if (booking.rows.length === 0) {
+      return res.status(404).json({ error: 'Booking not found or not authorized' });
+    }
+    
+    const currentSeats = booking.rows[0].seats;
+    const eventId = booking.rows[0].event_id;
+    const seatDifference = seats - currentSeats;
+    
+    // Check if there are enough seats available
+    const event = await pool.query(
+      'SELECT available_seats FROM events WHERE id = $1',
+      [eventId]
+    );
+    
+    if (event.rows[0].available_seats < seatDifference) {
+      return res.status(400).json({ error: 'Not enough seats available' });
+    }
+    
+    // Update booking
+    const result = await pool.query(
+      'UPDATE bookings SET seats = $1 WHERE id = $2 RETURNING *',
+      [seats, req.params.id]
+    );
+    
+    // Update available seats
+    await pool.query(
+      'UPDATE events SET available_seats = available_seats - $1 WHERE id = $2',
+      [seatDifference, eventId]
+    );
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update booking' });
   }
 });
 
